@@ -1,0 +1,4 @@
+[submodule "abstractions"]
+	path = abstractions
+	url = git@github.com:gpoesia/mathematical-abstractions.git
+	branch = loop

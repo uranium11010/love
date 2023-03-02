@@ -14,6 +14,7 @@ from torch.nn import functional as F
 import tqdm
 from grid_world import grid
 from world3d import world3d
+import rl
 
 
 class DQNAgent(object):
@@ -68,20 +69,37 @@ class DQNAgent(object):
                 # list of batched state, action
                 exp_batches = []
                 losses = []
-                for time_index in range(len(trajectories[0])):
-                    states = [(torch.tensor(trajectory[time_index][0]),
-                               torch.zeros(()).long())
-                              for trajectory in trajectories]
-                    actions = torch.tensor(np.stack(
-                        [trajectory[time_index][1]
-                         for trajectory in trajectories]))
-                    q_values = self._dqn._Q(states, None)[0]
-                    loss = F.cross_entropy(q_values, actions)
-                    losses.append(loss)
-                self._optimizer.zero_grad()
-                total_loss = sum(losses)
-                total_loss.backward()
-                self._optimizer.step()
+                has_instr = isinstance(trajectories[0][0][0], tuple)
+                if has_instr:
+                    experiences = []
+                    for time_index in range(18):
+                        experiences.extend(rl.Experience(*trajectory[time_index], False, {}, None, None)
+                                        for trajectory in trajectories if time_index < len(trajectory))
+                    self._optimizer.zero_grad()
+                    loss = self._dqn.loss(experiences, np.ones(len(experiences)))
+                    loss.backward()
+                    self._losses.append(loss.item())
+
+                    # clip according to the max allowed grad norm
+                    grad_norm = torch_utils.clip_grad_norm_(
+                            self._dqn.parameters(), self._max_grad_norm, norm_type=2)
+                    self._grad_norms.append(grad_norm.item())
+                    self._optimizer.step()
+                else:
+                    for time_index in range(18):
+                        states = [(torch.tensor(trajectory[time_index][0]),
+                                   torch.zeros(()).long())
+                                  for trajectory in trajectories if time_index < len(trajectory)]
+                        actions = torch.tensor(np.stack(
+                            [trajectory[time_index][1]
+                             for trajectory in trajectories if time_index < len(trajectory)]))
+                        q_values = self._dqn._Q(states, None)[0]
+                        loss = F.cross_entropy(q_values, actions)
+                        losses.append(loss)
+                    self._optimizer.zero_grad()
+                    total_loss = sum(losses)
+                    total_loss.backward()
+                    self._optimizer.step()
 
 
     def update(self, experience):

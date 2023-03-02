@@ -258,6 +258,10 @@ class DiscreteLatentDistributionVQ(nn.Module):
         one_hot_z[z_index] = 1
         return torch.matmul(one_hot_z, self.code_book)
 
+    def z_embedding_batch(self, z_list):
+        one_hot_z_list = F.one_hot(z_list, num_classes=self.latent_n).float()
+        return torch.matmul(one_hot_z_list, self.code_book)
+
 
 class DiscreteLatentDistribution(nn.Module):
     def __init__(self, input_size, latent_size, latent_n, feat_size=None):

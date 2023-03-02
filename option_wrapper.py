@@ -84,6 +84,40 @@ class OptionWrapper(gym.Wrapper):
         return self._current_state
 
 
+class AbsWrapper(gym.Wrapper):
+    """Augments the actions of the environment with options from SymSkill module.
+
+    The wrapped environment must have a discrete action space.
+    """
+
+    def __init__(self, env, abstractions):
+        super().__init__(TensorWrapper(env))
+
+        self.abstractions = abstractions
+
+        # Action space is default low-level actions + options
+        self.action_space = spaces.Discrete(
+                env.action_space.n + len(self.abstractions))
+
+    def step(self, action):
+        # Default low-level actions
+        if action < self.env.action_space.n:
+            state, reward, done, info = self.env.step(action)
+            return state, reward, done, info
+
+        ab = self.abstractions[action-self.env.action_space.n]
+        cum_reward = 0.
+        for ax in ab.get_abs_elts():
+            state, reward, done, info = self.env.step(ax.name._value_)
+            cum_reward += reward
+            if done:
+                break
+        return state, cum_reward, done, info
+            
+    def reset(self):
+        return self.env.reset()
+
+
 class TensorWrapper(gym.ObservationWrapper):
     def observation(self, state):
         return torch.tensor(state[0]), torch.tensor(state[1])

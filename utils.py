@@ -11,6 +11,10 @@ import os
 import pickle
 from grid_world import grid
 
+from abstractions.steps import AxStep, Solution
+from abstractions.compress import IAPLogN
+from abstractions.abstractions import Axiom
+
 FONT = ImageFont.truetype(
     os.path.join(os.path.dirname(__file__), "asset/fonts/arial.ttf"), 30
 )
@@ -587,21 +591,57 @@ def gridworld_loader(batch_size, path="./data/demos"):
 
 
 class ComPILEDataset(Dataset):
-    def __init__(self, partition):
+    def __init__(self, partition, abs_config=None):
         import sys
         sys.path.append('grid_world')
         trajectories = np.load("compile.npy", allow_pickle=True)
         self.partition = partition
         num_heldout = 100
+        
+        self.abs_config = abs_config
+        self.abs2idx = None
+        if abs_config is not None:
+            solutions = []
+            for traj in trajectories:
+                states = []
+                actions = []
+                for i in range(1, len(traj)-1):
+                    states.append(traj[i])
+                    actions.append(AxStep(traj[i][1]))
+                states.append(None)
+                sol = Solution(states, actions)
+                solutions.append(sol)
+            abstractor = IAPLogN(solutions, len(grid.Action), abs_config)
+            abstractions, new_sols = abstractor.iter_abstract(abs_config.get("num_iters", 1))
+            print(abstractions)
+            self.abs2idx = {ab: idx for idx, ab in enumerate(abstractions)}
+            abstracted_data = []
+            shape = trajectories[0][0][0].shape
+            null_state = (np.zeros(shape, dtype=np.float32), 0, np.zeros(shape, dtype=np.float32), -1, 1)
+            for sol in new_sols:
+                trajectory = [null_state]
+                for s, a in zip(sol.states, sol.actions):
+                    if a.rule.is_axiom:
+                        trajectory.append((*s, -1, 1))
+                    else:
+                        first = 1
+                        for sub_s, sub_a in zip(a.get_flat_ex_states(), a.get_flat_steps()):
+                            trajectory.append((*sub_s, self.abs2idx[a.rule], first))
+                            first = 0
+                trajectory.append(null_state)
+                abstracted_data.append(trajectory)
+            assert all(len(trajectory) == 18 for trajectory in abstracted_data)
+            trajectories = abstracted_data
+
         if self.partition == "train":
             self.state = trajectories[
                 :-num_heldout
             ]  # num_train x ep length x (s, a, s_tp1)
         else:
             self.state = trajectories[-num_heldout:]
-
         self.obs_size = self.state[0][0][0].shape
         self.action_size = len(grid.Action)
+        print("ACTION SIZE:", self.action_size)
 
     @property
     def seq_size(self):
@@ -612,13 +652,16 @@ class ComPILEDataset(Dataset):
 
     def __getitem__(self, index):
         traj = self.state[index]
-        s, a, _ = zip(*traj)
-        return np.stack(s).astype(np.float32), np.stack(a)
+        if self.abs_config is None:
+            s, a, _ = zip(*traj)
+            return np.stack(s).astype(np.float32), np.stack(a)
+        s, a, sp, z, m = zip(*traj)
+        return np.stack(s).astype(np.float32), np.stack(a), np.stack(sp).astype(np.float32), np.stack(z).astype(np.int64), np.stack(m).astype(np.int64)
 
 
-def compile_loader(batch_size):
-    train_dataset = ComPILEDataset(partition="train")
-    test_dataset = ComPILEDataset(partition="test")
+def compile_loader(batch_size, abs_config=None):
+    train_dataset = ComPILEDataset(partition="train", abs_config=abs_config)
+    test_dataset = ComPILEDataset(partition="test", abs_config=abs_config)
     train_loader = DataLoader(
         dataset=train_dataset, batch_size=batch_size, shuffle=True, drop_last=False
     )
@@ -692,3 +735,33 @@ def miniworld_loader(batch_size):
         dataset=test_dataset, batch_size=len(test_dataset), shuffle=False
     )
     return train_loader, test_loader
+
+
+def add_instruction_rewards(trajectory):
+    """ list of (s, a, s'); return ((s, i), a, r, (s', i')) """
+    rewards = []
+    for _, a, _ in trajectory:
+        if a is not 0 and a._name_ == "pickup":
+            rewards.append(1.)
+        else:
+            rewards.append(0.)
+    new_traj = []
+    cur_goal = 0
+    for (s, a, sp), r in zip(reversed(trajectory), reversed(rewards)):
+        if a is not 0 and a._name_ == "pickup":
+            prev_goal = _get_goal(s)
+        else:
+            prev_goal = cur_goal
+        new_traj.append(((torch.tensor(s, device=0), torch.tensor(prev_goal, device=0).long()),
+            a, r, (torch.tensor(sp, device=0), torch.tensor(cur_goal, device=0).long())))
+        cur_goal = prev_goal
+    return list(reversed(new_traj))
+
+
+def _get_goal(state):
+    for i in range(1, 9):
+        for j in range(1, 9):
+            if state[i,j,10]:
+                for k in range(10):
+                    if state[i,j,k]:
+                        return k

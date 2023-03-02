@@ -236,28 +236,28 @@ class HierarchicalStateSpaceModel(nn.Module):
         #######################
         enc_obs_list = self.enc_obs(obs_data_list)  # [B, S, D]
 
-        enc_action_list = self.action_encoder(action_list)
+        enc_action_list = self.action_encoder(action_list)  # [B, S, D]
 
         # Shift sequence length dimension forward and 0 out first one
         shifted_enc_actions = torch.roll(enc_action_list, 1, 1)
         mask = torch.ones_like(shifted_enc_actions, device=shifted_enc_actions.device)
         mask[:, 0, :] = 0
-        shifted_enc_actions = shifted_enc_actions * mask
+        shifted_enc_actions = shifted_enc_actions * mask  # [B, S, D]
 
         enc_combine_obs_action_list = self.combine_action_obs(
             torch.cat((enc_action_list, enc_obs_list), -1)
-        )
+        )  # [B, S, D]
         shifted_combined_action_list = self.combine_action_obs(
             torch.cat((shifted_enc_actions, enc_obs_list), -1)
-        )
+        )  # [B, S, D]
 
         ######################
         # boundary sampling ##
         ######################
-        post_boundary_log_alpha_list = self.post_boundary(shifted_combined_action_list)
+        post_boundary_log_alpha_list = self.post_boundary(shifted_combined_action_list)  # [B, S, 2] logits for boundaries
         boundary_data_list, post_boundary_sample_logit_list = self.boundary_sampler(
             post_boundary_log_alpha_list
-        )
+        )  # [B, S, 2] sampled boundaries and logits after Gumbel sampling
         boundary_data_list[:, : (init_size + 1), 0] = 1.0
         boundary_data_list[:, : (init_size + 1), 1] = 0.0
 
@@ -468,18 +468,18 @@ class HierarchicalStateSpaceModel(nn.Module):
 
         # return
         return [
-            obs_rec_list,
-            prior_boundary_log_density,
-            post_boundary_log_density,
-            prior_obs_state_list,
-            post_obs_state_list,
-            boundary_data_list,
-            prior_boundary_list,
-            post_boundary_list,
-            abs_state_list,
-            selected_option,
-            onehot_z_list,
-            vq_loss_list,
+            obs_rec_list,  # (B, S, A) logits for what action to take
+            prior_boundary_log_density,  # (B, S) log-prob of boundary at each step
+            post_boundary_log_density,  # (B, S) log-prob of boundary at each step
+            prior_obs_state_list,  # S-many (B, 8) normal distributions
+            post_obs_state_list,  # S-many (B, 8) normal distributions
+            boundary_data_list,  # (B, S, 1) of 0/1 indicating boundaries
+            prior_boundary_list,  # Bernoulli (B, S) for boundary probabilities
+            post_boundary_list,  # Bernoulli (B, S) for boundary probabilities
+            abs_state_list,  # S-many (B, D) for abstract states s
+            selected_option,  # (B, S) integer array for what actions were selected
+            onehot_z_list,  # (B, S, Z) one-hot array for what skills each step belongs to
+            vq_loss_list,  # (S,) for VQ losses at each step (accumulated across batch)
         ]
 
     def abs_marginal(self, obs_data_list, action_list, seq_size, init_size, n_sample=3):
@@ -613,7 +613,8 @@ class HierarchicalStateSpaceModel(nn.Module):
     def initial_boundary_state(self, state):
         # Initial padding token
         # Padding action *embedding* is masked out
-        enc_action = self.action_encoder(torch.zeros(1).long())
+        device = self.action_encoder._embedder._parameters['weight'].device
+        enc_action = self.action_encoder(torch.zeros(1, device=device).long())
         enc_action = enc_action.squeeze(0) * 0
         padding_state = state * 0
         enc_obs = (
@@ -622,7 +623,7 @@ class HierarchicalStateSpaceModel(nn.Module):
         boundary_state = [self.combine_action_obs(torch.cat((enc_action, enc_obs), -1))]
 
         # First action is set to 0
-        enc_action = self.action_encoder(torch.zeros(1).long()).squeeze(0)
+        enc_action = self.action_encoder(torch.zeros(1, device=device).long()).squeeze(0)
         enc_obs = self.enc_obs(state.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
         boundary_state.append(
             self.combine_action_obs(torch.cat((enc_action, enc_obs), -1))
@@ -645,6 +646,11 @@ class HierarchicalStateSpaceModel(nn.Module):
             boundary_state: hidden state to be passed back to next call to
                 z_terminates.
         """
+        read_logits, boundary_state = self.forward_z_terminates(state, prev_action, boundary_state)
+        terminate = read_logits[0] > read_logits[1]
+        return terminate, boundary_state
+        
+    def forward_z_terminates(self, state, prev_action, boundary_state=None):
         # List of combined action and obs embeddings of shape (embed_dim,)
         # The list is of length equal to number of timesteps T current z has
         # been active
@@ -672,8 +678,7 @@ class HierarchicalStateSpaceModel(nn.Module):
 
         # (2,)
         read_logits = self.post_boundary(enc_combine_obs_action_list)[0, -1]
-        terminate = read_logits[0] > read_logits[1]
-        return terminate, boundary_state
+        return read_logits, boundary_state
 
     def play_z(self, z, state, hidden_state=None, recurrent=False):
         """Returns the action from playing the z at state: a ~ pi(a | s, z).
@@ -689,6 +694,10 @@ class HierarchicalStateSpaceModel(nn.Module):
         Returns:
             action (int): a ~ pi(a | z, s_t)
         """
+        logits, hidden_state = self.forward_z(z, state, hidden_state, recurrent)
+        return torch.argmax(logits).item(), hidden_state
+
+    def forward_z(self, z, state, hidden_state=None, recurrent=False):
         if hidden_state is None:
             hidden_state = torch.zeros(1, self.abs_belief_size).float()
 
@@ -713,7 +722,72 @@ class HierarchicalStateSpaceModel(nn.Module):
 
         dummy_obs_belief = torch.zeros(abs_feat.shape[0], device=abs_feat.device)
         obs_feat = self.obs_feat(torch.cat((dummy_obs_belief, obs_state), 0))
-        return torch.argmax(self.dec_obs(obs_feat)).item(), hidden_state
+        return self.dec_obs(obs_feat), hidden_state
+
+    def forward_z_batch(self, obs_data_list, action_list, next_obs_data_list, z_list, m_list, seq_size, init_size, recurrent=False):
+        num_samples = obs_data_list.shape[0]
+        full_seq_size = obs_data_list.shape[1]
+
+        z_mask = z_list >= 0
+        z = self.post_abs_state.z_embedding_batch(z_list * z_mask)
+        dummy_abs_belief = torch.zeros(num_samples, full_seq_size, self.abs_belief_size, device=z.device)
+        abs_feat = self.abs_feat(torch.cat((dummy_abs_belief, z), -1))
+
+        enc_obs = self.enc_obs(obs_data_list)
+        enc_action = self.action_encoder(action_list)
+        hidden_state = torch.zeros(num_samples, self.abs_belief_size).float()
+
+        action_logits = []
+        actions = []
+        for t in range(init_size, init_size + seq_size):  # mask out atomic actions
+            read = m_list[:,t]
+            copy = 1 - read
+            if recurrent:
+                hidden_state = self.obs_post_fwd(enc_obs[:,t], hidden_state * copy)
+                post_obs_state = self.post_obs_state(torch.cat((hidden_state, abs_feat[:,t]), -1))
+            else:
+                post_obs_state = self.post_obs_state(torch.cat((enc_obs[:,t], abs_feat[:,t]), -1))
+            obs_state = post_obs_state
+            if self._output_normal:
+                obs_state = post_obs_state.mean
+            dummy_obs_belief = torch.zeros(num_samples, self.obs_belief_size, device=abs_feat.device)
+            obs_feat = self.obs_feat(torch.cat((dummy_obs_belief, obs_state), -1))
+            action_logits.append(self.dec_obs(obs_feat)[z_mask[:,t]])
+            actions.append(action_list[:,t][z_mask[:,t]])
+        action_logits = torch.cat(action_logits, 0)
+        actions = torch.cat(actions, 0)
+        loss = F.cross_entropy(action_logits, actions)
+
+        shifted_enc_actions = torch.roll(enc_action, 1, 1)
+        mask = torch.ones_like(shifted_enc_actions, device=shifted_enc_actions.device)
+        mask[:, 0, :] = 0
+        shifted_enc_actions = shifted_enc_actions * mask  # [B, S, D]
+        shifted_combined_action_list = self.combine_action_obs(torch.cat((shifted_enc_actions, enc_obs), -1))  # [B, S, D]
+        post_boundary_log_alpha_list = self.post_boundary(shifted_combined_action_list)  # [B, S, 2] logits for boundaries
+        true_boundaries = 1 - m_list
+        shifted_z_mask = torch.roll(z_mask, 1, 1)
+        loss += F.cross_entropy(post_boundary_log_alpha_list[shifted_z_mask], true_boundaries[shifted_z_mask])
+        return loss
+
+    def _initial_boundary_states(states):
+        # get initial boundary states
+        device = self.action_encoder._embedder._parameters['weight'].device
+        num_samples = len(states)
+        enc_action = self.action_encoder(torch.zeros(num_samples, device=device).long())
+        enc_action *= 0
+        padding_state = states * 0
+        enc_obs = (
+            self.enc_obs(padding_state.unsqueeze(0)).squeeze(0)
+        )
+        boundary_state = self.combine_action_obs(torch.cat((enc_action, enc_obs), -1))
+
+        # First action is set to 0
+        enc_action = self.action_encoder(torch.zeros(num_samples, device=device).long())
+        enc_obs = self.enc_obs(state.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+        boundary_state = torch.cat((boundary_state,
+            self.combine_action_obs(torch.cat((enc_action, enc_obs), -1))), 1)
+
+        return boundary_state
 
 
 class EnvModel(nn.Module):
